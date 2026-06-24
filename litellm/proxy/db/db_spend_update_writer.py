@@ -1604,231 +1604,143 @@ class DBSpendUpdateWriter:
         """
         Generic function to update daily spend for any entity type (user, team, org, tag, end_user, agent)
         """
-        from litellm.proxy.utils import _raise_failed_update_spend_exception
-
         verbose_proxy_logger.debug(
             f"Daily {entity_type.capitalize()} Spend transactions: {len(daily_spend_transactions)}"
         )
         BATCH_SIZE = 100
         start_time = time.time()
 
-        try:
-            while daily_spend_transactions:
+        while daily_spend_transactions:
+            transactions_to_process = dict(
+                sorted(
+                    daily_spend_transactions.items(),
+                    key=lambda x: (
+                        x[1].get("date") or "",
+                        x[1].get(entity_id_field) or "",
+                        x[1].get("api_key") or "",
+                        x[1].get("model") or "",
+                        x[1].get("custom_llm_provider") or "",
+                    ),
+                )[:BATCH_SIZE]
+            )
+
+            if not transactions_to_process:
+                return
+
+            table = getattr(prisma_client.db, table_name)
+
+            for key, transaction in transactions_to_process.items():
+                entity_id = transaction.get(entity_id_field)
+
+                where_clause = {
+                    unique_constraint_name: {
+                        entity_id_field: entity_id,
+                        "date": transaction["date"],
+                        "api_key": transaction["api_key"],
+                        "model": transaction["model"],
+                        "custom_llm_provider": transaction.get(
+                            "custom_llm_provider"
+                        )
+                        or "",
+                        "mcp_namespaced_tool_name": transaction.get(
+                            "mcp_namespaced_tool_name"
+                        )
+                        or "",
+                        "endpoint": transaction.get("endpoint") or "",
+                    }
+                }
+
+                create_data: Dict[str, Any] = {
+                    entity_id_field: entity_id,
+                    "date": transaction["date"],
+                    "api_key": transaction["api_key"],
+                    "model": transaction.get("model"),
+                    "model_group": transaction.get("model_group"),
+                    "mcp_namespaced_tool_name": transaction.get(
+                        "mcp_namespaced_tool_name"
+                    )
+                    or "",
+                    "custom_llm_provider": transaction.get("custom_llm_provider"),
+                    "endpoint": transaction.get("endpoint") or "",
+                    "prompt_tokens": transaction["prompt_tokens"],
+                    "completion_tokens": transaction["completion_tokens"],
+                    "spend": transaction["spend"],
+                    "api_requests": transaction["api_requests"],
+                    "successful_requests": transaction["successful_requests"],
+                    "failed_requests": transaction["failed_requests"],
+                }
+
+                update_data: Dict[str, Any] = {
+                    "prompt_tokens": {"increment": transaction["prompt_tokens"]},
+                    "completion_tokens": {
+                        "increment": transaction["completion_tokens"]
+                    },
+                    "spend": {"increment": transaction["spend"]},
+                    "api_requests": {"increment": transaction["api_requests"]},
+                    "successful_requests": {
+                        "increment": transaction["successful_requests"]
+                    },
+                    "failed_requests": {"increment": transaction["failed_requests"]},
+                    "endpoint": transaction.get("endpoint") or "",
+                }
+
+                if "cache_read_input_tokens" in transaction:
+                    create_data["cache_read_input_tokens"] = transaction.get(
+                        "cache_read_input_tokens", 0
+                    )
+                    update_data["cache_read_input_tokens"] = {
+                        "increment": transaction.get("cache_read_input_tokens", 0)
+                    }
+                if "cache_creation_input_tokens" in transaction:
+                    create_data["cache_creation_input_tokens"] = transaction.get(
+                        "cache_creation_input_tokens", 0
+                    )
+                    update_data["cache_creation_input_tokens"] = {
+                        "increment": transaction.get(
+                            "cache_creation_input_tokens", 0
+                        )
+                    }
+                if entity_type == "tag" and "request_id" in transaction:
+                    create_data["request_id"] = transaction.get("request_id")
+                    update_data["request_id"] = transaction.get("request_id")
+
                 for i in range(n_retry_times + 1):
                     try:
-                        # Sort the transactions to minimize the probability of deadlocks by reducing the chance of concurrent
-                        # trasactions locking the same rows/ranges in different orders.
-                        transactions_to_process = dict(
-                            sorted(
-                                daily_spend_transactions.items(),
-                                # Normally to avoid deadlocks we would sort by the index, but since we have sprinkled indexes
-                                # on our schema like we're discount Salt Bae, we just sort by all fields that have an index,
-                                # in an ad-hoc (but hopefully sensible) order of indexes. The actual ordering matters less than
-                                # ensuring that all concurrent transactions sort in the same order.
-                                # We could in theory use the dict key, as it contains basically the same fields, but this is more
-                                # robust to future changes in the key format.
-                                # If _update_daily_spend ever gets the ability to write to multiple tables at once, the sorting
-                                # should sort by the table first.
-                                key=lambda x: (
-                                    x[1].get("date") or "",
-                                    x[1].get(entity_id_field) or "",
-                                    x[1].get("api_key") or "",
-                                    x[1].get("model") or "",
-                                    x[1].get("custom_llm_provider") or "",
-                                ),
-                            )[:BATCH_SIZE]
+                        await table.upsert(
+                            where=where_clause,
+                            data={"create": create_data, "update": update_data},
                         )
-
-                        if len(transactions_to_process) == 0:
-                            verbose_proxy_logger.debug(
-                                f"No new transactions to process for daily {entity_type} spend update"
-                            )
-                            return
-
-                        try:
-                            async with prisma_client.db.batch_() as batcher:
-                                for _, transaction in transactions_to_process.items():
-                                    entity_id = transaction.get(entity_id_field)
-
-                                    # Construct the where clause dynamically
-                                    where_clause = {
-                                        unique_constraint_name: {
-                                            entity_id_field: entity_id,
-                                            "date": transaction["date"],
-                                            "api_key": transaction["api_key"],
-                                            "model": transaction["model"],
-                                            "custom_llm_provider": transaction.get(
-                                                "custom_llm_provider"
-                                            )
-                                            or "",
-                                            "mcp_namespaced_tool_name": transaction.get(
-                                                "mcp_namespaced_tool_name"
-                                            )
-                                            or "",
-                                            "endpoint": transaction.get("endpoint")
-                                            or "",
-                                        }
-                                    }
-
-                                    # Get the table dynamically
-                                    table = getattr(batcher, table_name)
-
-                                    # Common data structure for both create and update
-                                    common_data = {
-                                        entity_id_field: entity_id,
-                                        "date": transaction["date"],
-                                        "api_key": transaction["api_key"],
-                                        "model": transaction.get("model"),
-                                        "model_group": transaction.get("model_group"),
-                                        "mcp_namespaced_tool_name": transaction.get(
-                                            "mcp_namespaced_tool_name"
-                                        )
-                                        or "",
-                                        "custom_llm_provider": transaction.get(
-                                            "custom_llm_provider"
-                                        ),
-                                        "endpoint": transaction.get("endpoint") or "",
-                                        "prompt_tokens": transaction["prompt_tokens"],
-                                        "completion_tokens": transaction[
-                                            "completion_tokens"
-                                        ],
-                                        "spend": transaction["spend"],
-                                        "api_requests": transaction["api_requests"],
-                                        "successful_requests": transaction[
-                                            "successful_requests"
-                                        ],
-                                        "failed_requests": transaction[
-                                            "failed_requests"
-                                        ],
-                                    }
-
-                                    # Add cache-related fields if they exist
-                                    if "cache_read_input_tokens" in transaction:
-                                        common_data["cache_read_input_tokens"] = (
-                                            transaction.get(
-                                                "cache_read_input_tokens", 0
-                                            )
-                                        )
-                                    if "cache_creation_input_tokens" in transaction:
-                                        common_data["cache_creation_input_tokens"] = (
-                                            transaction.get(
-                                                "cache_creation_input_tokens", 0
-                                            )
-                                        )
-
-                                    if (
-                                        entity_type == "tag"
-                                        and "request_id" in transaction
-                                    ):
-                                        common_data["request_id"] = transaction.get(
-                                            "request_id"
-                                        )
-
-                                    # Create update data structure
-                                    update_data = {
-                                        "prompt_tokens": {
-                                            "increment": transaction["prompt_tokens"]
-                                        },
-                                        "completion_tokens": {
-                                            "increment": transaction[
-                                                "completion_tokens"
-                                            ]
-                                        },
-                                        "spend": {"increment": transaction["spend"]},
-                                        "api_requests": {
-                                            "increment": transaction["api_requests"]
-                                        },
-                                        "successful_requests": {
-                                            "increment": transaction[
-                                                "successful_requests"
-                                            ]
-                                        },
-                                        "failed_requests": {
-                                            "increment": transaction["failed_requests"]
-                                        },
-                                    }
-
-                                    # Add cache-related fields to update if they exist
-                                    if "cache_read_input_tokens" in transaction:
-                                        update_data["cache_read_input_tokens"] = {
-                                            "increment": transaction.get(
-                                                "cache_read_input_tokens", 0
-                                            )
-                                        }
-                                    if "cache_creation_input_tokens" in transaction:
-                                        update_data["cache_creation_input_tokens"] = {
-                                            "increment": transaction.get(
-                                                "cache_creation_input_tokens", 0
-                                            )
-                                        }
-
-                                    if (
-                                        entity_type == "tag"
-                                        and "request_id" in transaction
-                                    ):
-                                        update_data["request_id"] = transaction.get(
-                                            "request_id"
-                                        )
-
-                                    # Add endpoint to update_data so existing rows get their endpoint field updated
-                                    update_data["endpoint"] = (
-                                        transaction.get("endpoint") or ""
-                                    )
-
-                                    table.upsert(
-                                        where=where_clause,
-                                        data={
-                                            "create": common_data,
-                                            "update": update_data,
-                                        },
-                                    )
-                        except Exception as batch_error:
-                            # Log detailed error information for debugging batch upsert failures
-                            # This helps diagnose issues like unique constraint violations
-                            spend_log_error(
-                                "Daily %s spend batch upsert failed. "
-                                "Table: %s, Constraint: %s, Batch size: %d, Error: %s",
-                                entity_type,
-                                table_name,
-                                unique_constraint_name,
-                                len(transactions_to_process),
-                                str(batch_error),
-                                exc=batch_error,
-                            )
-                            raise
-
-                        verbose_proxy_logger.debug(
-                            f"Processed {len(transactions_to_process)} daily {entity_type} transactions in {time.time() - start_time:.2f}s"
-                        )
-
-                        # Remove processed transactions
-                        for key in transactions_to_process.keys():
-                            daily_spend_transactions.pop(key, None)
-
+                        daily_spend_transactions.pop(key, None)
                         break
-
                     except DB_CONNECTION_ERROR_TYPES as e:
                         if i >= n_retry_times:
-                            _raise_failed_update_spend_exception(
-                                e=e,
-                                start_time=start_time,
-                                proxy_logging_obj=proxy_logging_obj,
+                            spend_log_error(
+                                "Daily %s spend upsert failed after %d retries. "
+                                "Table: %s, Error: %s",
+                                entity_type,
+                                n_retry_times,
+                                table_name,
+                                str(e),
+                                exc=e,
                             )
-                        await asyncio.sleep(
-                            # Sleep a random amount to avoid retrying and deadlocking again: when two transactions deadlock they are
-                            # cancelled basically at the same time, so if they wait the same time they will also retry at the same time
-                            # and thus they are more likely to deadlock again.
-                            # Instead, we sleep a random amount so that they retry at slightly different times, lowering the chance of
-                            # repeated deadlocks, and therefore of exceeding the retry limit.
-                            random.uniform(2**i, 2 ** (i + 1))
+                            daily_spend_transactions.pop(key, None)
+                            break
+                        await asyncio.sleep(random.uniform(2**i, 2 ** (i + 1)))
+                    except Exception as e:
+                        spend_log_error(
+                            "Daily %s spend upsert failed. "
+                            "Table: %s, Constraint: %s, Error: %s",
+                            entity_type,
+                            table_name,
+                            unique_constraint_name,
+                            str(e),
+                            exc=e,
                         )
+                        daily_spend_transactions.pop(key, None)
+                        break
 
-        except Exception as e:
-            if "transactions_to_process" in locals():
-                for key in transactions_to_process.keys():  # type: ignore
-                    daily_spend_transactions.pop(key, None)
-            _raise_failed_update_spend_exception(
-                e=e, start_time=start_time, proxy_logging_obj=proxy_logging_obj
+            verbose_proxy_logger.debug(
+                f"Processed {len(transactions_to_process)} daily {entity_type} transactions in {time.time() - start_time:.2f}s"
             )
 
     @staticmethod
